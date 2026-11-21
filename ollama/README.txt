@@ -1,0 +1,1 @@
+ollama create ascend-en -f ./Modelfile

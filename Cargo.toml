@@ -1,0 +1,26 @@
+[package]
+name = "robot-assistant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.15"                 # window, 3D robot, animations, UI
+cpal = "0.15"                 # microphone capture
+rodio = "0.20"                # audio playback + mp3 decoding
+whisper-rs = "0.13"           # offline speech-to-text (whisper.cpp)
+ureq = { version = "2", features = ["json"] }   # talks to Ollama
+serde_json = "1"
+anyhow = "1"
+rand = "0.8"
+msedge-tts = "0.4.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+winit = "0.30"
+
+[build-dependencies]
+winres = "0.1"
+
+# Makes debug builds usable (Bevy and Whisper are very slow at opt-level 0)
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
