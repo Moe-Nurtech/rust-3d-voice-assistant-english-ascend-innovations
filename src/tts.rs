@@ -1,6 +1,7 @@
 //! Text-to-speech. Uses a built-in Rust client for Microsoft's Edge voices (no Python needed).
 //! If that ever fails, it falls back to the Python `edge-tts` tool when it is installed.
 
+use std::cell::RefCell;
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
@@ -22,7 +23,16 @@ pub fn synth(text: &str) -> Result<Vec<u8>> {
     synth_python(&text, &native_err)
 }
 
-fn synth_native(text: &str) -> Result<Vec<u8>> {
+/// A ready-to-use connection to the voice service (kept open between replies).
+type SynthFn = Box<dyn FnMut(&str) -> Result<Vec<u8>>>;
+
+thread_local! {
+    // One connection per thread. The worker thread keeps its connection open between replies,
+    // so only the first reply pays for the connection set-up.
+    static CLIENT: RefCell<Option<SynthFn>> = RefCell::new(None);
+}
+
+fn new_synth() -> Result<SynthFn> {
     let config = SpeechConfig {
         voice_name: VOICE.to_string(),
         audio_format: "audio-24khz-48kbitrate-mono-mp3".to_string(),
@@ -31,10 +41,47 @@ fn synth_native(text: &str) -> Result<Vec<u8>> {
         volume: 0,
     };
     let mut client = connect().map_err(|e| anyhow!("connect: {e}"))?;
-    let audio = client
-        .synthesize(&xml_escape(text), &config)
-        .map_err(|e| anyhow!("synthesize: {e}"))?;
-    Ok(audio.audio_bytes)
+    Ok(Box::new(move |text: &str| {
+        let audio = client
+            .synthesize(text, &config)
+            .map_err(|e| anyhow!("synthesize: {e}"))?;
+        Ok(audio.audio_bytes)
+    }))
+}
+
+/// Opens the connection ahead of time so the first reply does not have to wait for it.
+pub fn warm_up() {
+    CLIENT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            if let Ok(f) = new_synth() {
+                *slot = Some(f);
+            }
+        }
+    });
+}
+
+fn synth_native(text: &str) -> Result<Vec<u8>> {
+    let ssml_text = xml_escape(text);
+    CLIENT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+
+        // 1) reuse the connection we already have
+        if let Some(f) = slot.as_mut() {
+            if let Ok(bytes) = f(&ssml_text) {
+                if !bytes.is_empty() {
+                    return Ok(bytes);
+                }
+            }
+            *slot = None; // it went stale (the service closes idle connections): reconnect below
+        }
+
+        // 2) open a new connection and keep it for next time
+        let mut f = new_synth()?;
+        let bytes = f(&ssml_text)?;
+        *slot = Some(f);
+        Ok(bytes)
+    })
 }
 
 /// The text is placed inside SSML (XML), so these characters must be escaped.

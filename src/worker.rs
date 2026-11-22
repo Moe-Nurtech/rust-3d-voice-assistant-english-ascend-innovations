@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 use crate::{answers, audio, tts};
 
@@ -28,6 +30,8 @@ const SILENCE_END: Duration = Duration::from_millis(1200);
 const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(8);
 /// Never record longer than this
 const MAX_RECORDING: Duration = Duration::from_secs(30);
+/// Ignore the first moments after pressing the button (the click / key noise itself)
+const START_GRACE: Duration = Duration::from_millis(250);
 /// The speech threshold is measured from the room noise, but kept between these limits.
 /// Raise MIN_THRESHOLD if it never stops (noisy room). Lower it if it misses quiet speech.
 const MIN_THRESHOLD: f32 = 0.015;
@@ -58,6 +62,8 @@ pub enum Ev {
 pub fn run_worker(rx: Receiver<Cmd>, tx: Sender<Ev>) {
     // Make the voices for the info buttons in the background so clicking them is instant
     std::thread::spawn(prewarm_answers);
+    // Load the Ollama model into memory in the background so the first question is not slow
+    std::thread::spawn(warm_ollama);
     if let Err(e) = run(&rx, &tx) {
         let _ = tx.send(Ev::Status("Status: Error".into()));
         let _ = tx.send(Ev::Hint(format!("{e:#}")));
@@ -71,8 +77,19 @@ fn run(rx: &Receiver<Cmd>, tx: &Sender<Ev>) -> Result<()> {
     let (_stream, handle) = rodio::OutputStream::try_default()
         .map_err(|e| anyhow!("No audio output device: {e}"))?;
 
+    // Create the Whisper state ONCE and reuse it, and run a silent test so the first real question is fast
+    let mut state = ctx.create_state().map_err(|e| anyhow!("Whisper: {e}"))?;
+    let _ = tx.send(Ev::Status("Status: Warming up...".into()));
+    let _ = transcribe(&mut state, &vec![0.0f32; 16_000]);
+
+    // Open the microphone ONCE; it stays open and waits for the button / SPACE
+    let mut mic: Option<audio::Mic> = open_mic(tx);
+
     let mut history: Vec<(String, String)> = Vec::new();
     let _ = tx.send(Ev::Status("Status: Ready. Click the mic or press SPACE to talk".into()));
+
+    // Open the connection to the voice service now, so the first spoken reply is faster
+    tts::warm_up();
 
     loop {
         // 1) wait for the mic button / SPACE (start recording) or an info button (fixed answer)
@@ -89,31 +106,32 @@ fn run(rx: &Receiver<Cmd>, tx: &Sender<Ev>) -> Result<()> {
             }
             Err(_) => return Ok(()), // window closed
         }
-        let recorder = match audio::Recorder::start() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(Ev::Status("Status: Error".into()));
-                let _ = tx.send(Ev::Hint(format!("{e:#}")));
-                continue;
-            }
+        // reopen the microphone only if it was never opened or has failed
+        if mic.as_ref().map_or(true, |m| m.is_broken()) {
+            mic = open_mic(tx);
+        }
+        let Some(m) = mic.as_ref() else {
+            let _ = tx.send(Ev::Status("Status: Error".into()));
+            continue;
         };
+        m.begin(); // starts instantly: the microphone is already running
         let _ = tx.send(Ev::Hint(String::new()));
         let _ = tx.send(Ev::Transcript("...".into()));
         let _ = tx.send(Ev::State(RobotState::Listening));
         let _ = tx.send(Ev::Status("Status: Listening... just speak".into()));
 
         // 2) record until you stop talking (or press SPACE)
-        let heard = match wait_for_end_of_speech(rx, &recorder, tx) {
+        let heard = match wait_for_end_of_speech(rx, m, tx) {
             Some(heard) => heard,
             None => return Ok(()), // window closed
         };
-        let (samples, rate) = recorder.finish();
+        let (samples, rate) = m.end();
 
         // 3) process the turn
         if !heard {
             let _ = tx.send(Ev::Transcript("(I did not hear anything)".into()));
             let _ = tx.send(Ev::Status("Status: Ready. Click the mic or press SPACE to talk".into()));
-        } else if let Err(e) = turn(&ctx, &handle, tx, &mut history, samples, rate) {
+        } else if let Err(e) = turn(&mut state, &handle, tx, &mut history, samples, rate) {
             let _ = tx.send(Ev::Status("Status: Error".into()));
             let _ = tx.send(Ev::Hint(format!("{e:#}")));
         }
@@ -124,15 +142,27 @@ fn run(rx: &Receiver<Cmd>, tx: &Sender<Ev>) -> Result<()> {
     }
 }
 
+/// Opens the microphone (once). Shows a hint on screen if it fails.
+fn open_mic(tx: &Sender<Ev>) -> Option<audio::Mic> {
+    match audio::Mic::open() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            let _ = tx.send(Ev::Hint(format!("{e:#}")));
+            None
+        }
+    }
+}
+
 /// Blocks while recording. Returns Some(true) if speech was heard, Some(false) if not,
 /// and None if the window was closed.
 fn wait_for_end_of_speech(
     rx: &Receiver<Cmd>,
-    rec: &audio::Recorder,
+    mic: &audio::Mic,
     tx: &Sender<Ev>,
 ) -> Option<bool> {
     let start = Instant::now();
-    let mut threshold: Option<f32> = None;
+    // The room noise was already measured while idle, so there is no calibration delay
+    let thr = (mic.noise_floor() * 3.0).clamp(MIN_THRESHOLD, MAX_THRESHOLD);
     let mut heard = false;
     let mut last_loud = Instant::now();
 
@@ -144,20 +174,11 @@ fn wait_for_end_of_speech(
             Err(RecvTimeoutError::Timeout) => {}
         }
         let elapsed = start.elapsed();
+        if elapsed < START_GRACE {
+            continue; // ignore the click / key noise
+        }
 
-        // First 0.4 s: measure the room noise to set the speech threshold
-        let thr = match threshold {
-            Some(t) => t,
-            None => {
-                if elapsed >= Duration::from_millis(400) {
-                    let noise = rec.recent_rms(0.4);
-                    threshold = Some((noise * 3.0).clamp(MIN_THRESHOLD, MAX_THRESHOLD));
-                }
-                continue;
-            }
-        };
-
-        if rec.recent_rms(0.1) > thr {
+        if mic.recent_rms(0.1) > thr {
             if !heard {
                 let _ = tx.send(Ev::Status("Status: Listening... (stops when you pause)".into()));
             }
@@ -178,7 +199,7 @@ fn wait_for_end_of_speech(
 }
 
 fn turn(
-    ctx: &WhisperContext,
+    state: &mut WhisperState,
     handle: &rodio::OutputStreamHandle,
     tx: &Sender<Ev>,
     history: &mut Vec<(String, String)>,
@@ -195,7 +216,7 @@ fn turn(
         return Ok(());
     }
 
-    let text = transcribe(ctx, &audio16)?;
+    let text = transcribe(state, &audio16)?;
     if text.is_empty() {
         let _ = tx.send(Ev::Transcript("(I did not catch that)".into()));
         let _ = tx.send(Ev::Status("Status: Ready. Click the mic or press SPACE to talk".into()));
@@ -304,8 +325,7 @@ fn prewarm_answers() {
     }
 }
 
-fn transcribe(ctx: &WhisperContext, audio16k: &[f32]) -> Result<String> {
-    let mut state = ctx.create_state().map_err(|e| anyhow!("Whisper: {e}"))?;
+fn transcribe(state: &mut WhisperState, audio16k: &[f32]) -> Result<String> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("en"));
     params.set_translate(false);
@@ -317,7 +337,7 @@ fn transcribe(ctx: &WhisperContext, audio16k: &[f32]) -> Result<String> {
     params.set_single_segment(true);
     params.set_no_context(true);
     params.set_suppress_blank(true);
-    params.set_temperature_inc(0.0);
+    // (removed set_temperature_inc(0.0): it stopped Whisper from retrying poor decodes and hurt accuracy)
     params.set_n_threads(6);
 
     state.full(params, audio16k).map_err(|e| anyhow!("Whisper: {e}"))?;
@@ -330,6 +350,26 @@ fn transcribe(ctx: &WhisperContext, audio16k: &[f32]) -> Result<String> {
     // Whisper writes things like [BLANK_AUDIO] or (silence) when it hears nothing
     let is_noise_tag = (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('(') && t.ends_with(')'));
     Ok(if is_noise_tag { String::new() } else { t })
+}
+
+/// Loads the Ollama model and processes its system prompt once, so the first real question is fast.
+fn warm_ollama() {
+    let mut messages: Vec<Value> = Vec::new();
+    if !SYSTEM_PROMPT.is_empty() {
+        messages.push(json!({ "role": "system", "content": SYSTEM_PROMPT }));
+    }
+    messages.push(json!({ "role": "user", "content": "Hi" }));
+    let body = json!({
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": false,
+        "keep_alive": "24h",
+        "options": { "num_predict": 1 },
+    });
+    match ureq::post(OLLAMA_URL).timeout(Duration::from_secs(120)).send_json(body) {
+        Ok(_) => eprintln!("Ollama model is loaded and ready"),
+        Err(e) => eprintln!("Ollama warm-up failed (is Ollama running?): {e}"),
+    }
 }
 
 fn ask_ollama(history: &[(String, String)]) -> Result<String> {
@@ -347,7 +387,7 @@ fn ask_ollama(history: &[(String, String)]) -> Result<String> {
         "model": OLLAMA_MODEL,
         "messages": messages,
         "stream": false,
-        "keep_alive": "30m",
+        "keep_alive": "24h", // keep the model loaded in memory while you use the app
         "options": { "num_predict": 200 },
     });
 
