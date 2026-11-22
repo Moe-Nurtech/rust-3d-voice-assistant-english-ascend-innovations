@@ -271,10 +271,17 @@ fn speak(handle: &rodio::OutputStreamHandle, tx: &Sender<Ev>, text: &str, cached
     audio::robot_effect(&mut pcm, channels, sample_rate, 0.3);
 
     let _ = tx.send(Ev::Status("Status: Speaking (British male voice)...".into()));
+    // forget any old STOP click, then show the Talking state (which shows the STOP button)
+    audio::STOP_SPEECH.store(false, std::sync::atomic::Ordering::SeqCst);
     let _ = tx.send(Ev::State(RobotState::Talking));
     // playbackRate 0.97 in the web version -> play slightly slower/lower
-    audio::play(handle, pcm, channels, (sample_rate as f32 * 0.97) as u32)?;
-    let _ = tx.send(Ev::Status("Status: Finished! Click the mic or press SPACE to talk again".into()));
+    let stopped = audio::play(handle, pcm, channels, (sample_rate as f32 * 0.97) as u32)?;
+    let msg = if stopped {
+        "Status: Stopped. Click the mic or press SPACE to talk"
+    } else {
+        "Status: Finished! Click the mic or press SPACE to talk again"
+    };
+    let _ = tx.send(Ev::Status(msg.into()));
     Ok(())
 }
 

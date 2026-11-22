@@ -9,6 +9,7 @@ mod audio;
 mod tts;
 mod worker;
 
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
@@ -113,6 +114,7 @@ struct CurrentState(RobotState);
 enum Action {
     Mic,
     Say(&'static Answer),
+    Stop,
 }
 
 #[derive(Component)]
@@ -121,6 +123,10 @@ struct Backdrop; // the background picture, fixed behind the robot
 struct FloorGlow; // the glow under the robot's feet
 #[derive(Component)]
 struct ButtonPanel; // the info buttons on the right
+#[derive(Component)]
+struct StopPanel; // holds the red STOP button (shown only while the robot talks)
+#[derive(Component)]
+struct StopButton;
 #[derive(Component)]
 struct MicButton;
 #[derive(Component)]
@@ -304,9 +310,46 @@ fn setup(
         ))
         .with_children(|p| {
             line(p, "Ask me about:", 20.0, Color::WHITE, None);
-for answer in answers::all() {
-    button(p, answer.label, Action::Say(answer), false);
-}
+            for answer in answers::all() {
+                button(p, answer.label, Action::Say(answer), false);
+            }
+        });
+
+    // Red STOP button: appears in the same place while the robot is talking
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(14.0),
+                right: Val::Px(14.0),
+                width: Val::Px(250.0),
+                display: Display::None,
+                ..default()
+            },
+            StopPanel,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Button,
+                Action::Stop,
+                StopButton,
+                Node {
+                    width: Val::Percent(100.0),
+                    padding: UiRect::axes(Val::Px(16.0), Val::Px(18.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(stop_normal()),
+                BorderRadius::all(Val::Px(12.0)),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("STOP"),
+                    TextFont { font_size: 26.0, ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
         });
 }
 
@@ -548,6 +591,10 @@ fn keyboard(keys: Res<ButtonInput<KeyCode>>, tx: Res<WorkerTx>) {
     if keys.just_pressed(KeyCode::Space) {
         let _ = tx.0.send(Cmd::Toggle);
     }
+    // Esc = same as the red STOP button
+    if keys.just_pressed(KeyCode::Escape) {
+        audio::STOP_SPEECH.store(true, Ordering::SeqCst);
+    }
 }
 
 fn pump_events(
@@ -630,6 +677,15 @@ fn btn_hover() -> Color {
 fn btn_pressed() -> Color {
     Color::srgb(0.10, 0.25, 0.50)
 }
+fn stop_normal() -> Color {
+    Color::srgb(0.80, 0.14, 0.14)
+}
+fn stop_hover() -> Color {
+    Color::srgb(0.92, 0.24, 0.24)
+}
+fn stop_pressed() -> Color {
+    Color::srgb(0.58, 0.08, 0.08)
+}
 fn mic_color(state: RobotState) -> Color {
     match state {
         RobotState::Idle => btn_normal(),
@@ -667,16 +723,22 @@ fn button(p: &mut ChildBuilder, label: &str, action: Action, is_mic: bool) {
     });
 }
 
-/// Handles clicks on the mic button and the info buttons.
+/// Handles clicks on the mic button, the info buttons and the STOP button.
 fn buttons(
     mut q: Query<(&Interaction, &Action, &mut BackgroundColor), (Changed<Interaction>, With<Button>)>,
     mut cur: ResMut<CurrentState>,
     tx: Res<WorkerTx>,
 ) {
     for (interaction, action, mut bg) in &mut q {
+        // (normal, hover, pressed) colours for this button
+        let (normal, hover, pressed) = match action {
+            Action::Stop => (stop_normal(), stop_hover(), stop_pressed()),
+            Action::Mic => (mic_color(cur.0), btn_hover(), btn_pressed()),
+            Action::Say(_) => (btn_normal(), btn_hover(), btn_pressed()),
+        };
         match *interaction {
             Interaction::Pressed => {
-                bg.0 = btn_pressed();
+                bg.0 = pressed;
                 match action {
                     Action::Mic => {
                         // same as SPACE: start listening, or stop early while listening
@@ -693,15 +755,14 @@ fn buttons(
                             cur.0 = RobotState::Thinking; // hide the buttons right away
                         }
                     }
+                    Action::Stop => {
+                        // cut the speech now; the worker then sends the robot back to idle
+                        audio::STOP_SPEECH.store(true, Ordering::SeqCst);
+                    }
                 }
             }
-            Interaction::Hovered => bg.0 = btn_hover(),
-            Interaction::None => {
-                bg.0 = match action {
-                    Action::Mic => mic_color(cur.0),
-                    Action::Say(_) => btn_normal(),
-                }
-            }
+            Interaction::Hovered => bg.0 = hover,
+            Interaction::None => bg.0 = normal,
         }
     }
 }
@@ -709,8 +770,10 @@ fn buttons(
 /// Hides the info buttons unless the robot is idle, and updates the mic button.
 fn update_ui_state(
     cur: Res<CurrentState>,
-    mut panel: Query<&mut Node, With<ButtonPanel>>,
-    mut mic_bg: Query<&mut BackgroundColor, With<MicButton>>,
+    mut panel: Query<&mut Node, (With<ButtonPanel>, Without<StopPanel>)>,
+    mut stop_panel: Query<&mut Node, (With<StopPanel>, Without<ButtonPanel>)>,
+    mut mic_bg: Query<&mut BackgroundColor, (With<MicButton>, Without<StopButton>)>,
+    mut stop_bg: Query<&mut BackgroundColor, (With<StopButton>, Without<MicButton>)>,
     mut mic_label: Query<&mut Text, With<MicLabel>>,
 ) {
     if !cur.is_changed() {
@@ -718,6 +781,12 @@ fn update_ui_state(
     }
     for mut node in &mut panel {
         node.display = if cur.0 == RobotState::Idle { Display::Flex } else { Display::None };
+    }
+    for mut node in &mut stop_panel {
+        node.display = if cur.0 == RobotState::Talking { Display::Flex } else { Display::None };
+    }
+    for mut bg in &mut stop_bg {
+        bg.0 = stop_normal(); // fresh look every time it appears
     }
     for mut bg in &mut mic_bg {
         bg.0 = mic_color(cur.0);

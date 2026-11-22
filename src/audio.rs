@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -203,10 +204,20 @@ fn soft_limit(x: f32) -> f32 {
     y.min(1.0).copysign(x)
 }
 
-/// Plays the samples and blocks until they finish.
-pub fn play(handle: &OutputStreamHandle, samples: Vec<f32>, channels: u16, rate: u32) -> Result<()> {
+/// Set to true (by the STOP button or the Esc key) to cut the speech immediately.
+pub static STOP_SPEECH: AtomicBool = AtomicBool::new(false);
+
+/// Plays the samples and blocks until they finish, or until STOP_SPEECH is set.
+/// Returns true if it was stopped early.
+pub fn play(handle: &OutputStreamHandle, samples: Vec<f32>, channels: u16, rate: u32) -> Result<bool> {
     let sink = Sink::try_new(handle).context("Could not open the audio output")?;
     sink.append(SamplesBuffer::new(channels, rate, samples));
-    sink.sleep_until_end();
-    Ok(())
+    while !sink.empty() {
+        if STOP_SPEECH.load(Ordering::SeqCst) {
+            sink.stop();
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(false)
 }
